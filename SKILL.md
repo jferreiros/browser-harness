@@ -57,6 +57,39 @@ PY
   a cross-frame JS walker.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
 
+## Showing something to Joaquín — never spawn a duplicate tab
+
+He keeps dozens of tabs open because he cannot find things again. Do not add to it.
+
+**Every time you put a generated report, plan, deck or mockup in front of him, use
+`show_report(path)`** — never `new_tab()` and never `goto_url()`:
+
+```bash
+browser-harness -c '
+show_report("/Users/joaquin/Documents/projects/personal/_projects/foo/informe.html")
+'
+```
+
+`show_report` focuses the tab that already has that file and reloads it, and only
+opens a new tab when there is none. Calling it three times leaves one tab, not three.
+For any URL, the general form is `open_or_focus(url)`. `find_tab(url)` tells you if a
+tab exists without touching it, and `close_duplicate_tabs()` cleans up after the fact.
+
+Matching ignores the fragment, trailing slashes and percent-encoding, so a regenerated
+report lands in its own tab rather than beside it.
+
+`show_report` and `open_or_focus` are the only helpers that call `activate_tab()`.
+That is allowed here because their purpose is to show the page to Joaquín. For all
+other work, use `new_tab()` / `switch_tab()`: they work in the background and do not
+steal focus. `attach_quiet(target)` and `new_background_tab(url, browser_context_id)`
+remain as thin wrappers for older instructions.
+
+On this machine, `~/.config/browser-harness/agent-workspace` is a symlink to this
+repo's `agent-workspace/`, and its `.env` sets `BH_DOMAIN_SKILLS=1`. Domain skills are
+enabled: read `agent-workspace/domain-skills/<site>/` before you work on a site.
+
+Still true: never `goto_url()` on his active tab, and never open a fresh tab per step.
+
 ## Local Chrome
 
 The default daemon can keep many tabs and visit many sites; browser-harness has

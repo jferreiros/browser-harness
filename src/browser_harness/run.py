@@ -374,7 +374,13 @@ def _run(args):
     if args and args[0] == "--debug-clicks":
         os.environ["BH_DEBUG_CLICKS"] = "1"
         args = args[1:]
-    if not args and not sys.stdin.isatty():
+    if len(args) == 2 and args[0] == "-c":
+        # Local patch (jferreiros): keep the legacy `-c '<code>'` form working.
+        # Many local skills and instructions still call it. Upstream removed it in a9f7b1d.
+        code = args[1]
+        if not code.strip():
+            sys.exit(USAGE)
+    elif not args and not sys.stdin.isatty():
         code = sys.stdin.read()
         if not code.strip():
             sys.exit(USAGE)

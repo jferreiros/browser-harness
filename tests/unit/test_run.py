@@ -34,15 +34,15 @@ def test_require_existing_daemon_never_auto_starts(monkeypatch):
     mock_ensure.assert_not_called()
 
 
-def test_c_flag_is_rejected():
-    with patch.object(sys, "argv", ["browser-harness", "-c", "print('old path')"]), \
-         patch("sys.stdin", StringIO("print('ignored')")):
-        try:
-            run.main()
-        except SystemExit as e:
-            assert "browser-harness <<'PY'" in str(e)
-        else:
-            raise AssertionError("-c should be rejected")
+def test_c_flag_executes_code():
+    # Local patch (jferreiros): the legacy -c form stays supported.
+    stdout = StringIO()
+    with patch.object(sys, "argv", ["browser-harness", "-c", "print('hello from -c')"]), \
+         patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.print_update_banner"), \
+         patch("sys.stdout", stdout):
+        run.main()
+    assert stdout.getvalue().strip() == "hello from -c"
 
 
 def test_no_args_interactive_stdin_prints_usage():
