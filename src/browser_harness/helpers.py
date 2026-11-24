@@ -459,6 +459,15 @@ def close_tab(target=None):
     cdp("Target.closeTarget", targetId=target_id)
 
 
+def gc_tabs():
+    """Close tabs this daemon opened that are still about:blank. Never the attached
+    tab, never a tab someone else opened. Returns the closed target ids."""
+    r = _send({"meta": "gc_tabs"})
+    if "error" in r:
+        raise RuntimeError(r["error"])
+    return r.get("closed", [])
+
+
 def ensure_real_tab():
     """Switch to a real user tab if current is chrome:// / internal / stale."""
     tabs = list_tabs(include_chrome=False)

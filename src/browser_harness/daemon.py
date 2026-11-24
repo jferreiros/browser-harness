@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, signal, socket, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -34,6 +34,8 @@ NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
+# The dedicated tab of a named daemon, so a successor reuses it after a crash or SIGKILL
+TAB_FILE = ipc.pid_path(NAME).with_suffix(".tab")
 BUF = 500
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
@@ -128,6 +130,44 @@ TOGGLE_BOOT_GRACE = 12
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
 TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
+
+
+def idle_timeout():
+    """BH_IDLE_TIMEOUT seconds with no request before the daemon exits (0 = never).
+
+    Default: 30 min for a named local/CDP daemon, whose callers are usually
+    jobs that start it and forget it. Off for the default daemon (a new
+    connection to the user's Chrome can mean another Allow popup) and for
+    cloud daemons (their callers stop them explicitly)."""
+    raw = os.environ.get("BH_IDLE_TIMEOUT", "").strip()
+    if raw:
+        try:
+            seconds = float(raw)
+            return seconds if 0 < seconds < float("inf") else 0.0
+        except ValueError:
+            log(f"ignoring BH_IDLE_TIMEOUT={raw!r}: not a number of seconds")
+    return 1800.0 if NAME != "default" and not REMOTE_ID else 0.0
+
+
+def _saved_dedicated_tab():
+    try:
+        return TAB_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _save_dedicated_tab(tid):
+    try:
+        if tid:
+            TAB_FILE.write_text(tid, encoding="utf-8")
+        else:
+            TAB_FILE.unlink()
+    except OSError:
+        pass
+
+
+def is_blank_url(url):
+    return url in ("", "about:blank") or url.startswith("about:blank#")
 
 
 def tab_marker_enabled():
@@ -427,6 +467,8 @@ class Daemon:
         self.session = None
         self.target_id = None
         self.dedicated_target_id = None
+        self.created_target_ids = set()  # tabs opened through this daemon (Target.createTarget)
+        self.last_request = time.monotonic()
         self._dedicated_target_lock = asyncio.Lock()
         self._session_state_lock = asyncio.Lock()
         self._active_recoveries = 0
@@ -463,11 +505,18 @@ class Daemon:
                     refreshed = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
                     pages_by_id = {t["targetId"]: t for t in refreshed if t["type"] == "page"}
                     page = pages_by_id.get(self.target_id) or pages_by_id.get(self.dedicated_target_id)
+                    if page is None and (saved := _saved_dedicated_tab()) in pages_by_id:
+                        # A predecessor with this name died without cleanup
+                        # (SIGKILL, crash). Its tab is ours: reuse it.
+                        page = pages_by_id[saved]
+                        self.dedicated_target_id = saved
+                        log(f"named daemon {NAME}: reused dedicated tab of a previous daemon ({saved})")
                     if page is None:
                         tid = (await self.cdp.send_raw(
                             "Target.createTarget", {"url": "about:blank", "background": True}
                         ))["targetId"]
                         self.dedicated_target_id = tid
+                        _save_dedicated_tab(tid)
                         log(f"named daemon {NAME}: created dedicated tab ({tid})")
                         page = {"targetId": tid, "url": "about:blank", "type": "page"}
             tid = page["targetId"]
@@ -521,6 +570,36 @@ class Daemon:
         if enable_domains:
             await self._enable_default_domains(self.session)
         return pages[0]
+
+    async def close_blank_owned_tabs(self, keep=None):
+        """Close tabs this daemon opened that are still about:blank. Returns their ids.
+
+        Never touches a tab the daemon did not open, nor `keep`."""
+        owned = set(self.created_target_ids)
+        if self.dedicated_target_id:
+            owned.add(self.dedicated_target_id)
+        owned.discard(keep)
+        if not owned:
+            return []
+        targets = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+        alive = {t["targetId"] for t in targets if t["type"] == "page"}
+        closed = []
+        for t in targets:
+            tid = t["targetId"]
+            if tid in owned and t["type"] == "page" and is_blank_url(t.get("url", "")):
+                try:
+                    await self.cdp.send_raw("Target.closeTarget", {"targetId": tid})
+                    closed.append(tid)
+                except Exception as e:
+                    log(f"close blank tab {tid}: {e}")
+        gone = set(closed) | (owned - alive)
+        self.created_target_ids -= gone
+        if self.dedicated_target_id in gone:
+            self.dedicated_target_id = None
+            _save_dedicated_tab(None)
+        if closed:
+            log(f"closed {len(closed)} blank tab(s) this daemon opened")
+        return closed
 
     async def _close_inspect_tabs(self, targets):
         """Close chrome://inspect tabs left open by the permission recovery flow"""
@@ -670,6 +749,8 @@ class Daemon:
         if expected is not None and req.get("token") != expected:
             return {"error": "unauthorized"}
         meta = req.get("meta")
+        if meta != "ping":
+            self.last_request = time.monotonic()
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
         # `pid` lets restart_daemon() verify the live daemon's identity before
@@ -737,6 +818,13 @@ class Daemon:
             self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "gc_tabs":
+            async with self._session_state_lock:
+                async with self._dedicated_target_lock:
+                    try:
+                        return {"closed": await self.close_blank_owned_tabs(keep=self.target_id)}
+                    except Exception as e:
+                        return {"error": str(e)}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
             # cancel/drain existing handlers. In particular, a CDP replay that
@@ -766,7 +854,10 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
+                self.created_target_ids.add(result["targetId"])
+            return {"result": result}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid:
@@ -826,15 +917,37 @@ async def serve(d):
         finally:
             writer.close()
 
+    # SIGTERM (systemd stopping a job's cgroup, kill, restart_daemon) and SIGHUP
+    # run the same cleanup as meta=shutdown instead of leaving the tab behind.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, d.stop.set)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass  # Windows, or not the main thread
+
+    async def idle_exit(limit):
+        while not d.stop.is_set():
+            await asyncio.sleep(min(60.0, limit))
+            if time.monotonic() - d.last_request >= limit:
+                log(f"idle for {limit:.0f}s, exiting (BH_IDLE_TIMEOUT)")
+                d.stop.set()
+
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    limit = idle_timeout()
+    idle_task = asyncio.create_task(idle_exit(limit)) if limit else None
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        for t in (serve_task, stop_task, idle_task):
+            if t is None:
+                continue
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass
@@ -856,8 +969,14 @@ async def serve(d):
                                 "Target.closeTarget", {"targetId": d.dedicated_target_id}
                             )
                             d.dedicated_target_id = None
+                            _save_dedicated_tab(None)
                         except Exception as e:
                             log(f"close dedicated tab on shutdown: {e}")
+                    if d.cdp and d.created_target_ids:
+                        try:
+                            await d.close_blank_owned_tabs()
+                        except Exception as e:
+                            log(f"close blank tabs on shutdown: {e}")
         else:
             log("skip dedicated-tab cleanup: stale-session recovery did not stop")
         ipc.cleanup_endpoint(NAME)

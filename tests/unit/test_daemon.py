@@ -6,6 +6,12 @@ import pytest
 from browser_harness import daemon
 
 
+@pytest.fixture(autouse=True)
+def _private_tab_file(tmp_path, monkeypatch):
+    """Keep the dedicated-tab record out of the real runtime dir."""
+    monkeypatch.setattr(daemon, "TAB_FILE", tmp_path / "bu-test.tab")
+
+
 def test_publish_own_pid_never_truncates_parent_record(tmp_path, monkeypatch):
     pid_file = tmp_path / "daemon.pid"
     pid_file.write_text('{"pid":4321,"started":"process start with spaces"}')
@@ -845,3 +851,130 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+def test_named_daemon_records_and_reuses_dedicated_tab_of_dead_predecessor(monkeypatch):
+    """A daemon killed without cleanup leaves its tab; the next one reuses it."""
+    monkeypatch.setattr(daemon, "NAME", "worker-a")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+    first = daemon.Daemon()
+    first.cdp = _AttachCDP()
+    asyncio.run(first.attach_first_page())
+    assert daemon.TAB_FILE.read_text() == "created-1"
+
+    second = daemon.Daemon()
+    second.cdp = _AttachCDP(list(first.cdp.targets))
+    page = asyncio.run(second.attach_first_page())
+
+    assert page["targetId"] == "created-1"
+    assert second.dedicated_target_id == "created-1"
+    assert second.cdp.created == 0
+
+
+def test_saved_tab_that_is_gone_is_replaced(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "worker-a")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+    daemon.TAB_FILE.write_text("closed-long-ago")
+    d = daemon.Daemon()
+    d.cdp = _AttachCDP()
+
+    page = asyncio.run(d.attach_first_page())
+
+    assert page["targetId"] == "created-1"
+    assert daemon.TAB_FILE.read_text() == "created-1"
+
+
+def test_gc_tabs_closes_only_blank_tabs_the_daemon_opened(monkeypatch):
+    d = daemon.Daemon()
+    d.cdp = _AttachCDP([
+        {"targetId": "user-blank", "url": "about:blank", "type": "page"},
+        {"targetId": "mine-blank", "url": "about:blank", "type": "page"},
+        {"targetId": "mine-used", "url": "https://example.com/", "type": "page"},
+        {"targetId": "mine-attached", "url": "about:blank", "type": "page"},
+        {"targetId": "dedicated", "url": "about:blank#x", "type": "page"},
+    ])
+    d.created_target_ids = {"mine-blank", "mine-used", "mine-attached", "mine-gone"}
+    d.dedicated_target_id = "dedicated"
+    daemon.TAB_FILE.write_text("dedicated")
+    d.target_id = "mine-attached"
+
+    result = asyncio.run(d.handle({"meta": "gc_tabs"}))
+
+    assert sorted(result["closed"]) == ["dedicated", "mine-blank"]
+    assert sorted(d.cdp.closed) == ["dedicated", "mine-blank"]
+    assert d.created_target_ids == {"mine-used", "mine-attached"}
+    assert d.dedicated_target_id is None
+    assert not daemon.TAB_FILE.exists()
+
+
+def test_create_target_through_daemon_is_recorded():
+    d = daemon.Daemon()
+    d.cdp = _AttachCDP()
+
+    asyncio.run(d.handle({"method": "Target.createTarget", "params": {"url": "about:blank"}}))
+
+    assert d.created_target_ids == {"created-1"}
+
+
+@pytest.mark.parametrize("name,remote,env,expected", [
+    ("worker-a", None, "", 1800.0),
+    ("default", None, "", 0.0),
+    ("remote", "browser-1", "", 0.0),
+    ("worker-a", None, "0", 0.0),
+    ("default", None, "90", 90.0),
+    ("worker-a", None, "soon", 1800.0),
+])
+def test_idle_timeout_defaults(monkeypatch, name, remote, env, expected):
+    monkeypatch.setattr(daemon, "NAME", name)
+    monkeypatch.setattr(daemon, "REMOTE_ID", remote)
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    monkeypatch.setenv("BH_IDLE_TIMEOUT", env)
+    assert daemon.idle_timeout() == expected
+
+
+def _run_serve_until_stopped(monkeypatch, d, trigger):
+    async def wait_forever(*_args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(daemon.ipc, "serve", wait_forever)
+    monkeypatch.setattr(daemon.ipc, "sock_addr", lambda _name: "test-socket")
+    monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _name: None)
+    monkeypatch.setattr(daemon, "log", lambda _message: None)
+
+    async def run():
+        d.stop = asyncio.Event()
+        task = asyncio.create_task(daemon.serve(d))
+        await asyncio.sleep(0.1)
+        trigger()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(run())
+
+
+def test_sigterm_closes_the_dedicated_tab(monkeypatch):
+    """systemd stops a job's cgroup with SIGTERM: the tab must not stay behind."""
+    import signal
+    monkeypatch.setenv("BH_IDLE_TIMEOUT", "0")
+    d = daemon.Daemon()
+    d.cdp = _AttachCDP()
+    d.dedicated_target_id = "daemon-tab"
+    daemon.TAB_FILE.write_text("daemon-tab")
+
+    _run_serve_until_stopped(monkeypatch, d, lambda: os.kill(os.getpid(), signal.SIGTERM))
+
+    assert d.cdp.closed == ["daemon-tab"]
+    assert not daemon.TAB_FILE.exists()
+
+
+def test_idle_daemon_exits_and_closes_its_tab(monkeypatch):
+    monkeypatch.setenv("BH_IDLE_TIMEOUT", "0.2")
+    d = daemon.Daemon()
+    d.cdp = _AttachCDP()
+    d.dedicated_target_id = "daemon-tab"
+    d.last_request -= 10
+
+    _run_serve_until_stopped(monkeypatch, d, lambda: None)
+
+    assert d.cdp.closed == ["daemon-tab"]

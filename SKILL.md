@@ -46,6 +46,11 @@ PY
   Do not invent per-job names such as `gmail1375` or `slack1371`: every new
   local daemon opens another browser-level CDP connection and Chrome may show
   another Allow prompt.
+- A named daemon (`BU_NAME=...`) opens one dedicated `about:blank` tab. It
+  closes that tab when it stops (`--reload`, SIGTERM, SIGHUP) and after 30 min
+  with no request (`BH_IDLE_TIMEOUT` seconds, `0` = never). A daemon killed
+  with SIGKILL leaves its tab; the next daemon with the same name reuses it.
+  `gc_tabs()` closes the tabs this daemon opened that are still `about:blank`.
 - Set `BH_TAB_MARKER=0` before starting the daemon to leave page titles unchanged.
   The horse marker remains enabled by default.
 - A timeout or page that pauses while hidden is not permission to foreground
